@@ -1,28 +1,247 @@
 ---
-title: "new_rmd"
+title: "Assignment 1"
+author: "Corbin Schmeil"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
 output: html_document
+
 ---
 
-```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
+```{r setup, include = F}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+##Assignment Description
+This is a write up of assignment 1, where I create a bar graph showing the last 42 months of gas/electricity usage in the 9 bay area counties as well as a map visualization of residential usage change due to COVID.
+```{r}
+library(tidyverse)
+library(plotly)
+library(sf)
+library(tigris)
+library(leaflet)
+library(censusapi)
+library(zoo)
+
+Sys.setenv(CENSUS_KEY="c8aa67e4086b4b5ce3a8717f59faa9a28f611dab")
+```
+##Stacking the data
+First I loop through all the downloaded PGE data to create a singular dataset with all the relevant information. Both gas and electricity converted to KBTU's to make them have the same column entries/data scales.
+```{r}
+
+years <- 2017:2020
+quarters <- 1:4
+types <- c("Electric","Gas")
+
+pge_all <- NULL
+
+for(year in years) {
+  for(quarter in quarters) {
+    if (year %in% 2020 & quarter %in% 3){
+      next()
+    }
+    if (year %in% 2020 & quarter %in% 4){
+      next()
+    }
+    for(type in types){
+    filename <- 
+      paste0(
+        "PGE_",
+        year,
+        "_Q",
+        quarter,
+        "_",
+        type,
+        "UsageByZip.csv"
+      )
+    
+  
+    print(filename)
+    
+    temp <- read_csv(filename)
+    
+    if (type=="Gas"){
+      temp <- mutate(temp,TOTALKBTU = TOTALTHM * 99.9761)
+      temp <- select(temp,-TOTALTHM, -AVERAGETHM)
+    }else{
+      temp <- mutate(temp,TOTALKBTU = TOTALKWH * 3.412)
+      temp <- select(temp, -TOTALKWH, -AVERAGEKWH)
+      
+    }
+    pge_all <- rbind(pge_all,temp)
+    # Note rbind requires field names to be consistent for every new thing that you add.
+  
+    saveRDS(pge_all, "pge_all.rds")
+    }
+  }
+}
+
+```
+##Filtering Zipcodes
+Next I narrow down to the relevant zip codes for the 9 bay area counties
+```{r}
+ca_counties <- counties("CA", cb = T, progress_bar = F)
+st_crs(ca_counties)
+projection <- "+proj=utm +zone=10 +ellps=GRS80 +datum=NAD83 +units=ft +no_defs"
+ca_counties_transformed <- 
+  ca_counties %>% 
+  st_transform(4326) %>% 
+  st_transform(26910) %>% 
+  st_transform(projection) %>% 
+  st_transform(st_crs(ca_counties))
+usa_zips <- 
+  zctas(cb = T, progress_bar = F)
+bay_county_names <-
+  c(
+    "Alameda",
+    "Contra Costa",
+    "Marin",
+    "Napa",
+    "San Francisco",
+    "San Mateo",
+    "Santa Clara",
+    "Solano",
+    "Sonoma"
+  )
+bay_cbgs <- 
+  bay_county_names %>% 
+  map_dfr(function(county) {
+    block_groups("CA", county, cb = T, progress_bar = F)
+  })
+bay_counties <-
+  ca_counties %>%
+  filter(NAME %in% bay_county_names)
+bay_zips <-
+  usa_zips %>% 
+  st_centroid() %>% 
+  .[bay_counties, ] %>% 
+  st_set_geometry(NULL) %>% 
+  left_join(usa_zips %>% select(GEOID10)) %>% 
+  st_as_sf()
+
+pge_bay_filtered <-
+  pge_all %>% 
+  filter(CUSTOMERCLASS %in% c("Gas- Residential", "Elec- Residential", "Gas- Commercial", "Elec- Commercial")) %>% 
+  mutate(
+    ZIPCODE = ZIPCODE %>% as.character()
+  ) %>% 
+  group_by(ZIPCODE, CUSTOMERCLASS) %>%
+  right_join(
+    bay_zips %>% select(GEOID10),
+    by = c("ZIPCODE" = "GEOID10")
+  ) %>%  
+  ungroup() %>% 
+  group_by(CUSTOMERCLASS,MONTH,YEAR) %>% 
+  summarize(
+    TOTALKBTU = sum(TOTALKBTU, na.rm = T)
+  ) %>%
+   mutate(
+      DATE = as.yearmon(paste(YEAR, MONTH),"%Y %m")
+    )
+#pge_bay_filtered
+```
+##Bar Graph of results
+Now I plot the PGE data for combined 9 bay area counties for gas and electricity, residential and commercial, for the time from 2017 to halfway through 2020. Aside from the interesting fluke of September 2017, the general trend seems to be that overall energy usage increases significantly between December and March, largely as a result of residential gas usage. As for significant changes due to COVID, none are readily apparent simply by observing the bar graph.
+```{r}
+
+pge_bay_chart <-
+  pge_bay_filtered %>% 
+  ggplot() +
+  geom_bar(
+    aes(
+      x = DATE%>%factor(),
+      y = TOTALKBTU,
+      fill = CUSTOMERCLASS
+    ),
+    stat = "identity",
+    position = "stack"
+  ) +
+  theme(axis.text.x= element_text(size=6, angle=90))+
+  labs(
+    x = "Date",
+    y = "kBTU",
+    title = "PG&E Bay Area Monthly Electric & Gas Usage, 2017-2020",
+    fill = "Energy Type"
+  ) 
+pge_bay_chart %>% 
+  ggplotly() %>% 
+  layout(
+    xaxis = list(fixedrange = T),
+    yaxis = list(fixedrange = T)
+  ) %>% 
+  config(displayModeBar = F) 
+  
+```
+```{r}
+
+pge_sf <-
+  pge_all %>% 
+  filter(CUSTOMERCLASS %in% c("Gas- Residential", "Elec- Residential", "Gas- Commercial", "Elec- Commercial")) %>% 
+  mutate(
+    ZIPCODE = ZIPCODE %>% as.character()
+  ) %>% 
+  group_by(ZIPCODE, YEAR, CUSTOMERCLASS, MONTH) %>%
+  summarize(
+    TOTALKBTU = sum(TOTALKBTU, na.rm = T)
+  ) %>% 
+  right_join(
+    bay_zips %>% select(GEOID10),
+    by = c("ZIPCODE" = "GEOID10")
+  )
+pge_sf$Date <- as.yearmon(paste(pge_sf$YEAR, pge_sf$MONTH), "%Y %m")
+pge_sf$Date <- NULL  
+pge_compare <-
+  pge_sf %>% 
+  filter(CUSTOMERCLASS == "Elec- Residential", YEAR %in% 2019:2020, MONTH %in% 3:4) %>%
+  pivot_wider(
+    names_from = YEAR, 
+    values_from = TOTALKBTU,
+    values_fill = 0
+  ) %>% 
+  rename(
+    KBTU2019 = "2019",
+    KBTU2020 = "2020"
+  ) %>%
+  mutate(
+    KBTU_change = ((KBTU2020 - KBTU2019)/(KBTU2019)) * 100
+ ) %>% 
+ st_as_sf()
 ```
 
-## R Markdown
 
-This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
 
-When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
 
-```{r cars}
-summary(cars)
+
+## Map of COVID impact, March/April in 2019 vs 2020
+Finally here is the map of percentage change in residential electricity usage from 2019 to this year, comparing March and April (I considered these months to be the first two with large impact resulting from COVID due to lockdowns, etc.)
+So the biggest assumption I made here was that the best way to look at change due to COVID was year to year as opposed to transition between months, because typically electricity usage would be higher in winter months so the transition between winter and spring may interfere with observing changes due to COVID. Lots of places experienced an increase from last year to this year in electricity usage. Zipcode 94970, Stinson Beach CA, experienced a 31% increase, for example. Most zipcodes sat between a 5% and 15% increase in usage, while very few experienced a decrease during COVID.Palo Alto zipcodes experienced abput a 15% increase.94158, in San Francisco, increased by 34%, which is quite a bit. 94612 in Oakland experienced a -84% change, which seems like it could possibly be an error of some sort.
+```{r}
+  res_pal <- colorNumeric(
+  palette = "Spectral",
+  domain = 
+    pge_compare$KBTU_change
+)
+leaflet() %>% 
+  addTiles() %>% 
+  addPolygons(
+    data = pge_compare,
+    fillColor = ~res_pal(KBTU_change),
+    color = "white",
+    opacity = 0.5,
+    fillOpacity = 0.5,
+    weight = 1,
+    label = ~paste0(
+      round(KBTU_change), 
+      " % Usage Change in ",
+      ZIPCODE
+    ),
+    highlightOptions = highlightOptions(
+      weight = 2,
+      opacity = 1
+    )
+  ) %>% 
+  addLegend(
+    data = pge_compare,
+    pal = res_pal,
+    values = ~KBTU_change,
+    title = "% Change in <br>Residential Electricity<br> Use due to <br>COVID-19 in <br>March/April 2019 vs 2020"
+  )
 ```
 
-## Including Plots
-
-You can also embed plots, for example:
-
-```{r pressure, echo=FALSE}
-plot(pressure)
-```
-
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
